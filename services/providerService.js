@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { createHttpError } from './streamManager.js';
+import { PluginProviderRegistry } from '../src/registry/pluginProviderRegistry.js';
 
 const require = createRequire(import.meta.url);
 const { mkdir, readFile, readdir, rm, writeFile } = fsPromises;
@@ -776,32 +777,38 @@ const toLabel = (providerId) =>
     .replace(/[_-]+/g, ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
 
-const discoverProviders = () => {
+const discoverProviders = (pluginProviderRegistry = null) => {
   const discovered = new Map();
 
-  if (!fs.existsSync(PROVIDERS_DIR)) {
-    return discovered;
-  }
+  if (fs.existsSync(PROVIDERS_DIR)) {
+    const providerFiles = fs.readdirSync(PROVIDERS_DIR)
+      .filter((fileName) => fileName.endsWith('.js'))
+      .sort();
 
-  const providerFiles = fs.readdirSync(PROVIDERS_DIR)
-    .filter((fileName) => fileName.endsWith('.js'))
-    .sort();
+    for (const fileName of providerFiles) {
+      const providerId = path.basename(fileName, '.js').toLowerCase();
 
-  for (const fileName of providerFiles) {
-    const providerId = path.basename(fileName, '.js').toLowerCase();
+      if (IGNORED_PROVIDER_IDS.has(providerId) || DISABLED_PROVIDER_IDS.has(providerId)) {
+        continue;
+      }
 
-    if (IGNORED_PROVIDER_IDS.has(providerId) || DISABLED_PROVIDER_IDS.has(providerId)) {
-      continue;
+      discovered.set(providerId, {
+        id: providerId,
+        label: toLabel(providerId),
+        modulePath: path.join(PROVIDERS_DIR, fileName)
+      });
     }
-
-    discovered.set(providerId, {
-      id: providerId,
-      label: toLabel(providerId),
-      modulePath: path.join(PROVIDERS_DIR, fileName)
-    });
   }
 
   for (const provider of Object.values(LOCAL_PROVIDERS)) {
+    if (DISABLED_PROVIDER_IDS.has(provider.id)) {
+      continue;
+    }
+
+    discovered.set(provider.id, provider);
+  }
+
+  for (const provider of pluginProviderRegistry?.getProviderConfigs?.() || []) {
     if (DISABLED_PROVIDER_IDS.has(provider.id)) {
       continue;
     }
@@ -1479,7 +1486,11 @@ const FAST_RESULT_LAST_GOOD_TTL_MS = Math.max(
 
 export class ProviderService {
   constructor() {
-    this.providers = discoverProviders();
+    this.pluginProviderRegistry = new PluginProviderRegistry({
+      cacheDir: config.CACHE_DIR,
+      logger
+    });
+    this.providers = discoverProviders(this.pluginProviderRegistry);
     this.providerCacheDir = path.join(config.CACHE_DIR, 'provider-results');
     this.fastResultCacheDir = path.join(config.CACHE_DIR, 'fast-last-good');
     this.moduleCache = new Map();
@@ -1500,6 +1511,7 @@ export class ProviderService {
       mkdir(this.providerCacheDir, { recursive: true }),
       mkdir(this.fastResultCacheDir, { recursive: true })
     ]);
+    await this.pluginProviderRegistry.initialize();
     setTimeout(() => {
       this.removeExpiredDiskEntries().catch((error) => {
         logger.warn('provider cache cleanup after startup failed', { error });
@@ -3023,23 +3035,26 @@ export class ProviderService {
       })
       : null;
 
-    const runProvider = () => providerFetchContextStorage.run(
+    const runProvider = (providerSignal = null) => providerFetchContextStorage.run(
       {
         providerId
       },
-      () => this.invokeProvider(providerConfig, providerId, params)
+      () => this.invokeProvider(providerConfig, providerId, {
+        ...params,
+        signal: providerSignal
+      })
     );
 
     const providerPromise = withCombinedAbortSignal(
       [abortController.signal, signal],
       (combinedSignal) => {
         if (requiresExplicitCancellationRace) {
-          return runProvider();
+          return runProvider(abortController.signal);
         }
 
         return providerAbortSignalStorage.run(
           combinedSignal,
-          () => runProvider()
+          () => runProvider(combinedSignal)
         );
       },
       `Provider ${providerId} timed out`
@@ -3604,6 +3619,26 @@ export class ProviderService {
   }
 
   async invokeProvider(providerConfig, providerId, params) {
+    if (providerConfig.kind === 'plugin-adapter') {
+      const adapter = this.pluginProviderRegistry.getAdapter(providerConfig.adapterId);
+
+      if (!adapter) {
+        throw createHttpError(500, `Plugin adapter ${providerConfig.adapterId} is not registered`);
+      }
+
+      return adapter.getStreams({
+        providerId,
+        tmdbId: params.tmdbId,
+        mediaType: params.mediaType,
+        season: params.season,
+        episode: params.episode,
+        signal: params.signal,
+        streamOptions: params.streamOptions,
+        pluginProviderSelections: params.streamOptions?.pluginProviderSelections || null,
+        privateProviderSettings: params.privateProviderSettings
+      });
+    }
+
     if (providerConfig.invocation === 'subprocess') {
       return this.invokeProviderSubprocess(providerConfig, providerId, params);
     }
